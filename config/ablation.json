@@ -1,0 +1,57 @@
+{
+  "name": "ablation",
+  "description": "Structural ablation settings used in the paper.",
+  "common": {
+    "encoder_name": "microsoft/codebert-base",
+    "encoder_local_path": "checkpoints/codebert-base",
+    "epochs": 30,
+    "learning_rate": 2e-05,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.1,
+    "grad_accum": 1,
+    "early_stop_patience": 6,
+    "amp": true,
+    "num_workers": 8,
+    "freeze_encoder": true,
+    "unfreeze_last_n": 2,
+    "max_length": 256,
+    "graph_hidden": 128,
+    "segment_len": 32,
+    "batch_size": 16,
+    "split_seed": 42,
+    "splits_dir": "splits/samplewise",
+    "seeds": [
+      0,
+      7,
+      42,
+      123,
+      2025
+    ],
+    "pos_weight_strategy": "one"
+  },
+  "variants": [
+    {
+      "name": "full",
+      "args": []
+    },
+    {
+      "name": "hier_only",
+      "args": [
+        "--no-graph"
+      ]
+    },
+    {
+      "name": "graph_only",
+      "args": [
+        "--no-hier-attn"
+      ]
+    },
+    {
+      "name": "cls_only",
+      "args": [
+        "--no-graph",
+        "--no-hier-attn"
+      ]
+    }
+  ]
+}

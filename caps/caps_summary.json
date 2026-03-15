@@ -1,0 +1,38 @@
+{
+  "policy": "ast_topk_v1",
+  "k": 16,
+  "top_m": 12,
+  "datasets_dir": "datasets",
+  "datasets": {
+    "bigvul_c": {
+      "bags_total": 1700,
+      "bags_kept": 1700,
+      "bags_dropped_empty": 0,
+      "funcs_selected_total": 20064
+    },
+    "bugsinpy_python": {
+      "bags_total": 2416,
+      "bags_kept": 2416,
+      "bags_dropped_empty": 0,
+      "funcs_selected_total": 21668
+    },
+    "defactors_python": {
+      "bags_total": 1700,
+      "bags_kept": 1700,
+      "bags_dropped_empty": 0,
+      "funcs_selected_total": 13625
+    },
+    "devign_c": {
+      "bags_total": 27318,
+      "bags_kept": 27318,
+      "bags_dropped_empty": 0,
+      "funcs_selected_total": 27318
+    },
+    "promise_java": {
+      "bags_total": 1695,
+      "bags_kept": 1695,
+      "bags_dropped_empty": 0,
+      "funcs_selected_total": 13060
+    }
+  }
+}

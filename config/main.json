@@ -1,0 +1,55 @@
+{
+  "name": "main",
+  "description": "Main HAM-Net configuration used for the paper's primary experiments.",
+  "model_variant": "full",
+  "common": {
+    "encoder_name": "microsoft/codebert-base",
+    "encoder_local_path": "checkpoints/codebert-base",
+    "epochs": 30,
+    "learning_rate": 2e-05,
+    "weight_decay": 0.01,
+    "warmup_ratio": 0.1,
+    "grad_accum": 1,
+    "early_stop_patience": 6,
+    "amp": true,
+    "num_workers": 8,
+    "freeze_encoder": true,
+    "unfreeze_last_n": 2,
+    "max_length": 256,
+    "graph_hidden": 128,
+    "segment_len": 32,
+    "pos_weight_strategy": "one",
+    "caps_apply_splits": "train,val"
+  },
+  "protocols": {
+    "samplewise": {
+      "splits_dir": "splits/samplewise",
+      "split_seed": 42,
+      "batch_size": 16,
+      "seeds": [
+        0,
+        7,
+        42,
+        123,
+        2025
+      ]
+    },
+    "cpdp": {
+      "splits_dir": "splits/cpdp",
+      "split_seed": 42,
+      "batch_size": 16,
+      "seeds": [
+        0,
+        7,
+        42,
+        123,
+        2025,
+        3407,
+        4096,
+        8192,
+        16384,
+        32768
+      ]
+    }
+  }
+}

@@ -1,0 +1,19 @@
+name: ham-net
+channels:
+  - conda-forge
+  - pytorch
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pandas
+  - scikit-learn
+  - tqdm
+  - pyyaml
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pip:
+      - transformers
+      - datasets
+      - sentencepiece
