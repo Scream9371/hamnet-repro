@@ -1,6 +1,5 @@
 """Dataset loading and tensor packaging utilities for HAM-Net."""
 
-import difflib
 import hashlib
 import json
 import random
@@ -10,13 +9,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.nn.utils.rnn import pad_sequence
-from sklearn.model_selection import train_test_split
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
 PAD_TOKEN = "<pad>"
 UNK_TOKEN = "<unk>"
-AST_SEQ_LEN: int | None = None
 
 
 def _encode_code_tokens(
@@ -122,7 +119,6 @@ def apply_caps_to_records(
 def load_records(
     data_path: Path, *, max_samples: Optional[int] = None, seed: int = 42
 ) -> List[dict]:
-
     path = Path(data_path)
     raw_records: List[dict] = []
     with path.open("r", encoding="utf-8") as fh:
@@ -133,7 +129,6 @@ def load_records(
             raw_records.append(json.loads(line))
 
     if raw_records and "functions" in raw_records[0]:
-
         records: List[dict] = []
         for raw in raw_records:
             functions = []
@@ -170,11 +165,6 @@ def load_records(
             records = rng.sample(records, max_samples)
         return records
 
-
-    if raw_records and _looks_like_patch_dataset(raw_records[0]):
-        raw_records = _apply_diff_window(raw_records)
-
-
     records: List[dict] = []
     for raw in raw_records:
         records.append(
@@ -193,228 +183,6 @@ def load_records(
         rng = random.Random(seed)
         records = rng.sample(records, max_samples)
     return records
-
-
-def _looks_like_patch_dataset(sample: Dict[str, Any]) -> bool:
-
-    return all(
-        key in sample for key in ("bug_id", "file_path", "function_name", "version")
-    )
-
-
-def _compute_changed_lines(old_src: str, new_src: str) -> Tuple[int, int]:
-
-    old_lines = old_src.splitlines()
-    new_lines = new_src.splitlines()
-    changed: set[int] = set()
-
-    diff = difflib.unified_diff(
-        old_lines, new_lines, fromfile="a", tofile="b", lineterm=""
-    )
-
-    old_line_no = 0
-    new_line_no = 0
-
-    for line in diff:
-        if line.startswith("@@"):
-            try:
-                header = line.split(" ")
-                old_range = header[1]
-                old_start = int(old_range.split(",")[0][1:])
-                old_line_no = old_start - 1
-                new_range = header[2]
-                new_start = int(new_range.split(",")[0][1:])
-                new_line_no = new_start - 1
-            except Exception:
-                continue
-        elif line.startswith("-"):
-            old_line_no += 1
-            changed.add(old_line_no)
-        elif line.startswith("+"):
-            new_line_no += 1
-        else:
-            old_line_no += 1
-            new_line_no += 1
-
-    if not changed:
-
-        return 1, len(old_lines) if old_lines else 1
-    return min(changed), max(changed)
-
-
-def _apply_diff_window(records: Sequence[Dict[str, Any]], window_radius: int = 20) -> List[Dict[str, Any]]:
-
-    from collections import defaultdict
-
-
-    grouped: Dict[Tuple[str, str, str], Dict[int, Dict[str, Any]]] = defaultdict(dict)
-    for rec in records:
-        bug_id = rec.get("bug_id")
-        file_path = rec.get("file_path")
-        func_name = rec.get("function_name")
-        label_raw = rec.get("label", None)
-        if bug_id is None or file_path is None or func_name is None:
-            continue
-        try:
-            label = int(label_raw)
-        except Exception:
-            continue
-        key = (str(bug_id), str(file_path), str(func_name))
-
-        if label not in grouped[key]:
-            grouped[key][label] = rec
-
-
-    windowed_code: Dict[Tuple[str, str, str], Dict[int, str]] = {}
-    iter_pairs = [
-        (key, pair) for key, pair in grouped.items() if 0 in pair and 1 in pair
-    ]
-    if not iter_pairs:
-        return list(records)
-
-    for key, pair in tqdm(iter_pairs, desc="Building diff windows", unit="function"):
-        buggy_rec = pair[1]
-        fixed_rec = pair[0]
-        buggy_src = buggy_rec.get("code", "")
-        fixed_src = fixed_rec.get("code", "")
-
-
-        buggy_start, buggy_end = _compute_changed_lines(buggy_src, fixed_src)
-        buggy_lines = buggy_src.splitlines()
-        if not buggy_lines:
-            buggy_window = buggy_src
-        else:
-            start = max(buggy_start - window_radius, 1)
-            end = min(buggy_end + window_radius, len(buggy_lines))
-            buggy_window = "\n".join(buggy_lines[start - 1 : end])
-
-
-        fixed_start, fixed_end = _compute_changed_lines(fixed_src, buggy_src)
-        fixed_lines = fixed_src.splitlines()
-        if not fixed_lines:
-            fixed_window = fixed_src
-        else:
-            start_f = max(fixed_start - window_radius, 1)
-            end_f = min(fixed_end + window_radius, len(fixed_lines))
-            fixed_window = "\n".join(fixed_lines[start_f - 1 : end_f])
-
-        windowed_code[key] = {1: buggy_window, 0: fixed_window}
-
-
-    new_records: List[Dict[str, Any]] = []
-    for rec in records:
-        bug_id = rec.get("bug_id")
-        file_path = rec.get("file_path")
-        func_name = rec.get("function_name")
-        if bug_id is None or file_path is None or func_name is None:
-            new_records.append(rec)
-            continue
-        key = (str(bug_id), str(file_path), str(func_name))
-        code_map = windowed_code.get(key)
-        if not code_map:
-            new_records.append(rec)
-            continue
-        try:
-            label = int(rec.get("label"))
-        except Exception:
-            new_records.append(rec)
-            continue
-        if label not in code_map:
-            new_records.append(rec)
-            continue
-        rec_copy = dict(rec)
-        rec_copy["code"] = code_map[label]
-        new_records.append(rec_copy)
-
-    return new_records
-
-
-def _split_records(
-    records: Sequence[dict],
-    train_ratio: float,
-    val_ratio: float,
-    test_ratio: float,
-    seed: int,
-) -> (List[dict], List[dict], List[dict]):
-
-    total = train_ratio + val_ratio + test_ratio
-    assert total > 0, "The sum of split ratios must be greater than 0."
-
-    train_r = train_ratio / total
-    val_r = val_ratio / total
-    test_r = test_ratio / total
-
-    labels = [rec["label"] for rec in records]
-    train_records, temp_records = train_test_split(
-        records,
-        test_size=val_r + test_r,
-        stratify=labels,
-        random_state=seed,
-    )
-    if val_r == 0 and test_r == 0:
-        return list(train_records), [], []
-
-    if val_r == 0:
-        return list(train_records), [], list(temp_records)
-    if test_r == 0:
-        return list(train_records), list(temp_records), []
-
-    temp_labels = [rec["label"] for rec in temp_records]
-    val_size = val_r / (val_r + test_r)
-    val_records, test_records = train_test_split(
-        temp_records,
-        test_size=1 - val_size,
-        stratify=temp_labels,
-        random_state=seed,
-    )
-    return list(train_records), list(val_records), list(test_records)
-
-
-def _group_split_records(
-    records: Sequence[dict],
-    train_ratio: float,
-    val_ratio: float,
-    test_ratio: float,
-    seed: int,
-    group_key: str,
-) -> (List[dict], List[dict], List[dict]):
-
-    total = train_ratio + val_ratio + test_ratio
-    assert total > 0, "The sum of split ratios must be greater than 0."
-    train_r = train_ratio / total
-    val_r = val_ratio / total
-    test_r = test_ratio / total
-    from collections import defaultdict
-
-    groups: Dict[str, List[dict]] = defaultdict(list)
-    for rec in records:
-        key = str(rec.get(group_key, "unknown"))
-        groups[key].append(rec)
-
-    group_ids = list(groups.keys())
-    rng = random.Random(seed)
-    rng.shuffle(group_ids)
-
-    n = len(group_ids)
-    train_cut = int(n * train_r)
-    val_cut = train_cut + int(n * val_r)
-
-
-    train_ids = group_ids[:train_cut]
-    val_ids = group_ids[train_cut:val_cut]
-    if abs(test_ratio) < 1e-6:
-        train_ids = train_ids + group_ids[val_cut:]
-        test_ids = []
-    else:
-        test_ids = group_ids[val_cut:]
-
-    def _collect(ids: Sequence[str]) -> List[dict]:
-        out: List[dict] = []
-        for gid in ids:
-            out.extend(groups[gid])
-        return out
-
-    return _collect(train_ids), _collect(val_ids), _collect(test_ids)
 
 
 def build_ast_vocab(records: Sequence[dict]) -> Dict[str, int]:
@@ -621,8 +389,6 @@ class ClassMilDataset(Dataset):
 
 @dataclass
 class DatasetBundle:
-
-
     train: Dataset
     val: Optional[Dataset]
     test: Optional[Dataset]
@@ -631,114 +397,7 @@ class DatasetBundle:
     bag_level: bool
 
 
-def build_datasets(
-    records: List[dict],
-    tokenizer,
-    *,
-    max_length: int,
-    train_ratio: float,
-    val_ratio: float,
-    test_ratio: float,
-    seed: int,
-    group_key: Optional[str] = None,
-    max_funcs_per_class: Optional[int] = None,
-    caps_map: Optional[Dict[str, List[int]]] = None,
-    caps_dataset_name: Optional[str] = None,
-    caps_apply_splits: Optional[Sequence[str]] = None,
-) -> DatasetBundle:
-
-    if group_key:
-        train_records, val_records, test_records = _group_split_records(
-            records, train_ratio, val_ratio, test_ratio, seed, group_key
-        )
-    else:
-        train_records, val_records, test_records = _split_records(
-            records, train_ratio, val_ratio, test_ratio, seed
-        )
-    is_bag_level = bool(train_records and "functions" in train_records[0])
-    if is_bag_level and caps_map:
-        apply_set = set(caps_apply_splits or ("train", "val"))
-        dataset_name = caps_dataset_name or "dataset"
-        if "train" in apply_set:
-            train_records, _ = apply_caps_to_records(
-                train_records, dataset_name=dataset_name, caps_map=caps_map
-            )
-        if "val" in apply_set:
-            val_records, _ = apply_caps_to_records(
-                val_records, dataset_name=dataset_name, caps_map=caps_map
-            )
-        if "test" in apply_set:
-            test_records, _ = apply_caps_to_records(
-                test_records, dataset_name=dataset_name, caps_map=caps_map
-            )
-    vocab = build_ast_vocab(train_records)
-
-    if is_bag_level:
-        dataset_cls = ClassMilDataset
-        dataset_kwargs = {"max_funcs": max_funcs_per_class}
-    else:
-        dataset_cls = FunctionGraphDataset
-        dataset_kwargs = {}
-
-    train_dataset = dataset_cls(
-        train_records,
-        tokenizer,
-        max_length,
-        vocab,
-        split_name="train",
-        **dataset_kwargs,
-    )
-    val_dataset = (
-        dataset_cls(
-            val_records,
-            tokenizer,
-            max_length,
-            vocab,
-            split_name="val",
-            **dataset_kwargs,
-        )
-        if val_records
-        else None
-    )
-    test_dataset = (
-        dataset_cls(
-            test_records,
-            tokenizer,
-            max_length,
-            vocab,
-            split_name="test",
-            **dataset_kwargs,
-        )
-        if test_records
-        else None
-    )
-
-    def _count(items: Sequence[dict]) -> Dict[str, int]:
-        from collections import Counter
-
-        counter = Counter(rec["label"] for rec in items)
-        return {str(k): int(v) for k, v in counter.items()}
-
-    stats = {
-        "train": _count(train_records),
-        "val": _count(val_records) if val_records else {},
-        "test": _count(test_records) if test_records else {},
-    }
-
-    return DatasetBundle(
-        train=train_dataset,
-        val=val_dataset,
-        test=test_dataset,
-        node_vocab=vocab,
-        label_stats=stats,
-        bag_level=is_bag_level,
-    )
-
-
 def collate_graph_batch(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-
-    global AST_SEQ_LEN
-
     pad_ids = [int(sample.get("pad_token_id", 0)) for sample in samples]
     pad_id = max(set(pad_ids), key=pad_ids.count) if pad_ids else 0
     input_ids = pad_sequence(
@@ -764,23 +423,6 @@ def collate_graph_batch(samples: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             for sample in samples
         ],
     }
-    if AST_SEQ_LEN:
-        seqs = []
-        masks = []
-        for sample in samples:
-            ids = sample["node_ids"]
-            trimmed = ids[:AST_SEQ_LEN]
-            pad_len = AST_SEQ_LEN - trimmed.size(0)
-            if pad_len > 0:
-                trimmed = torch.cat(
-                    [trimmed, torch.zeros(pad_len, dtype=ids.dtype)], dim=0
-                )
-            seqs.append(trimmed)
-            mask = torch.zeros(AST_SEQ_LEN, dtype=torch.long)
-            mask[: min(len(ids), AST_SEQ_LEN)] = 1
-            masks.append(mask)
-        batch["ast_seq"] = torch.stack(seqs, dim=0)
-        batch["ast_mask"] = torch.stack(masks, dim=0)
     return batch
 
 
@@ -798,7 +440,6 @@ def collate_class_batch(
     file_paths: List[str | None] = []
     function_names: List[str | None] = []
     function_labels: List[float | None] = []
-    global AST_SEQ_LEN
     for b_idx, sample in enumerate(samples):
         labels.append(sample["labels"])
         projects.append(sample.get("project", "unknown"))
@@ -857,36 +498,4 @@ def collate_class_batch(
         "function_labels": function_labels,
         "graphs": graphs,
     }
-    if AST_SEQ_LEN:
-        seqs = []
-        masks = []
-        for graph in graphs:
-            ids = graph["node_ids"]
-            trimmed = ids[:AST_SEQ_LEN]
-            pad_len = AST_SEQ_LEN - trimmed.size(0)
-            if pad_len > 0:
-                trimmed = torch.cat(
-                    [trimmed, torch.zeros(pad_len, dtype=ids.dtype)], dim=0
-                )
-            seqs.append(trimmed)
-            mask = torch.zeros(AST_SEQ_LEN, dtype=torch.long)
-            mask[: min(len(ids), AST_SEQ_LEN)] = 1
-            masks.append(mask)
-        batch["ast_seq"] = (
-            torch.stack(seqs, dim=0)
-            if seqs
-            else torch.empty((0, AST_SEQ_LEN), dtype=torch.long)
-        )
-        batch["ast_mask"] = (
-            torch.stack(masks, dim=0)
-            if masks
-            else torch.empty((0, AST_SEQ_LEN), dtype=torch.long)
-        )
-
     return batch
-
-
-def set_ast_seq_len(length: Optional[int]) -> None:
-
-    global AST_SEQ_LEN
-    AST_SEQ_LEN = length if length and length > 0 else None

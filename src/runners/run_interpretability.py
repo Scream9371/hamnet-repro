@@ -26,12 +26,8 @@ if str(RUNNER_ROOT) not in sys.path:
     sys.path.insert(0, str(RUNNER_ROOT))
 
 from hamnet.data import (
-    ClassMilDataset,
-    FunctionGraphDataset,
-    build_datasets,
     collate_class_batch,
     load_records,
-    set_ast_seq_len,
 )
 from hamnet.model import HAMNetModel
 from hamnet.utils import save_json, set_seed
@@ -139,9 +135,7 @@ def move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[st
 
 
 def build_bundle_from_config(cfg: Dict[str, Any], tokenizer, data_path: Path):
-
     def _resolve_repo_relative_path(raw: str) -> Path:
-
         p = Path(str(raw))
         if p.exists() or not p.is_absolute():
             return p
@@ -156,92 +150,40 @@ def build_bundle_from_config(cfg: Dict[str, Any], tokenizer, data_path: Path):
                     return candidate
 
         for base in ("splits_cpdp", "splits_samplewise", "splits_sample", "splits"):
-            candidate = (repo_root / base / p.name).resolve()
-            if candidate.exists():
-                return candidate
+                candidate = (repo_root / base / p.name).resolve()
+                if candidate.exists():
+                    return candidate
         return p
-
     records = load_records(
         data_path, max_samples=cfg.get("max_samples"), seed=int(cfg.get("seed", 42))
     )
-
     split_file = cfg.get("split_file")
-    if split_file not in (None, "", "None"):
-        split_path = _resolve_repo_relative_path(str(split_file))
-        if not split_path.is_absolute():
-
-
-            repo_root = REPO_ROOT
-            candidate = (repo_root / split_path).resolve()
-            if candidate.exists():
-                split_path = candidate
-        split_data = json.loads(split_path.read_text(encoding="utf-8"))
-        splits = split_data.get("splits") or {}
-        train_idx = splits.get("train", {}).get("indices", [])
-        val_idx = splits.get("val", {}).get("indices", [])
-        test_idx = splits.get("test", {}).get("indices", [])
-        train_records = [records[i] for i in train_idx if i < len(records)]
-        val_records = [records[i] for i in val_idx if i < len(records)]
-        test_records = [records[i] for i in test_idx if i < len(records)]
-        return build_bundle_from_split(
-            train_records,
-            val_records,
-            test_records,
-            tokenizer,
-            int(cfg.get("max_length", 256)),
+    if split_file in (None, "", "None"):
+        raise RuntimeError(
+            "Interpretability evaluation in the reproducibility repository "
+            "requires a fixed split_file in config.json."
         )
-
-    leaveout = cfg.get("leaveout_project")
-    if leaveout in (None, "", "None"):
-        leaveout = None
-
-    if leaveout:
-        train_val_records = [
-            rec for rec in records if rec.get("project", "unknown") != leaveout
-        ]
-        test_records = [
-            rec for rec in records if rec.get("project", "unknown") == leaveout
-        ]
-    else:
-        train_val_records = records
-        test_records = None
-
-    split_by = cfg.get("split_by", "sample")
-    if split_by == "project":
-        group_key = "project"
-    elif split_by == "bug":
-        group_key = "bug_id"
-    elif split_by == "file":
-        group_key = "file_path"
-    else:
-        group_key = None
-
-    bundle = build_datasets(
-        train_val_records,
+    split_path = _resolve_repo_relative_path(str(split_file))
+    if not split_path.is_absolute():
+        repo_root = REPO_ROOT
+        candidate = (repo_root / split_path).resolve()
+        if candidate.exists():
+            split_path = candidate
+    split_data = json.loads(split_path.read_text(encoding="utf-8"))
+    splits = split_data.get("splits") or {}
+    train_idx = splits.get("train", {}).get("indices", [])
+    val_idx = splits.get("val", {}).get("indices", [])
+    test_idx = splits.get("test", {}).get("indices", [])
+    train_records = [records[i] for i in train_idx if i < len(records)]
+    val_records = [records[i] for i in val_idx if i < len(records)]
+    test_records = [records[i] for i in test_idx if i < len(records)]
+    return build_bundle_from_split(
+        train_records,
+        val_records,
+        test_records,
         tokenizer,
-        max_length=int(cfg.get("max_length", 256)),
-        train_ratio=float(cfg.get("train_ratio", 0.8)),
-        val_ratio=float(cfg.get("val_ratio", 0.1)),
-        test_ratio=0.0 if leaveout else float(cfg.get("test_ratio", 0.1)),
-        seed=int(cfg.get("seed", 42)),
-        group_key=group_key,
-        max_funcs_per_class=cfg.get("max_funcs_per_class"),
+        int(cfg.get("max_length", 256)),
     )
-
-    if leaveout and test_records:
-        ds_cls = ClassMilDataset if bundle.bag_level else FunctionGraphDataset
-        ds_kwargs = (
-            {"max_funcs": cfg.get("max_funcs_per_class")} if bundle.bag_level else {}
-        )
-        bundle.test = ds_cls(
-            test_records,
-            tokenizer,
-            int(cfg.get("max_length", 256)),
-            bundle.node_vocab,
-            split_name=f"leaveout_test:{leaveout}",
-            **ds_kwargs,
-        )
-    return bundle
 
 
 def load_model_from_dir(
@@ -266,7 +208,6 @@ def load_model_from_dir(
         unfreeze_last_n=int(cfg.get("unfreeze_last_n", 0)),
         use_graph=not bool(cfg.get("no_graph", False)),
         use_hier_attn=not bool(cfg.get("no_hier_attn", False)),
-        use_ast_seq=bool(cfg.get("use_ast_seq", False)),
     ).to(device)
     state = torch.load(model_dir / "best_model.pt", map_location=device)
     model.load_state_dict(state)
@@ -303,8 +244,6 @@ def forward_single_bag(
             attention_mask=batch["attention_mask"],
             graphs=batch["graphs"],
             bag_idx=batch.get("bag_idx"),
-            ast_seq=batch.get("ast_seq"),
-            ast_mask=batch.get("ast_mask"),
         )
     probs = torch.sigmoid(logits).detach().cpu().numpy()
     return {"prob": float(probs[0]), "attn": attn, "batch": batch_cpu}
@@ -326,10 +265,6 @@ def _mask_function_subset(
     new_batch["attention_mask"] = batch_cpu["attention_mask"][keep].clone()
     new_batch["bag_idx"] = torch.zeros(len(keep), dtype=torch.long)
     new_batch["graphs"] = [batch_cpu["graphs"][i] for i in keep]
-    if "ast_seq" in batch_cpu:
-        new_batch["ast_seq"] = batch_cpu["ast_seq"][keep].clone()
-    if "ast_mask" in batch_cpu:
-        new_batch["ast_mask"] = batch_cpu["ast_mask"][keep].clone()
 
     function_names = batch_cpu.get("function_names")
     if function_names is not None:
@@ -349,11 +284,6 @@ def _build_batched_function_subset_batch(
     mask_chunks = []
     bag_idx_all: List[int] = []
     graphs_all: List[Dict[str, torch.Tensor]] = []
-    ast_seq_chunks = []
-    ast_mask_chunks = []
-
-    has_ast_seq = "ast_seq" in batch_cpu
-    has_ast_mask = "ast_mask" in batch_cpu
 
     for bag_id, keep_indices in enumerate(keep_sets):
         keep = sorted(set(int(i) for i in keep_indices))
@@ -363,10 +293,6 @@ def _build_batched_function_subset_batch(
         mask_chunks.append(batch_cpu["attention_mask"][keep])
         graphs_all.extend(batch_cpu["graphs"][i] for i in keep)
         bag_idx_all.extend([bag_id] * len(keep))
-        if has_ast_seq:
-            ast_seq_chunks.append(batch_cpu["ast_seq"][keep])
-        if has_ast_mask:
-            ast_mask_chunks.append(batch_cpu["ast_mask"][keep])
 
     if not input_chunks:
         raise ValueError("keep_sets is empty, so no batched subset can be constructed.")
@@ -377,10 +303,6 @@ def _build_batched_function_subset_batch(
         "graphs": graphs_all,
         "bag_idx": torch.tensor(bag_idx_all, dtype=torch.long),
     }
-    if has_ast_seq:
-        out["ast_seq"] = torch.cat(ast_seq_chunks, dim=0).clone()
-    if has_ast_mask:
-        out["ast_mask"] = torch.cat(ast_mask_chunks, dim=0).clone()
     return out
 
 
@@ -395,8 +317,6 @@ def _run_batched_probs(
             attention_mask=batch["attention_mask"],
             graphs=batch["graphs"],
             bag_idx=batch.get("bag_idx"),
-            ast_seq=batch.get("ast_seq"),
-            ast_mask=batch.get("ast_mask"),
         )
     probs = torch.sigmoid(logits).detach().cpu().numpy().tolist()
 
@@ -414,8 +334,6 @@ def _run_batch_prob(model: HAMNetModel, batch_cpu: Dict[str, Any], device: torch
             attention_mask=batch["attention_mask"],
             graphs=batch["graphs"],
             bag_idx=batch.get("bag_idx"),
-            ast_seq=batch.get("ast_seq"),
-            ast_mask=batch.get("ast_mask"),
         )
     return float(torch.sigmoid(logits)[0].item())
 
@@ -835,10 +753,6 @@ def main() -> None:
         else cfg.get("encoder_name", "microsoft/codebert-base")
     )
     tokenizer = AutoTokenizer.from_pretrained(encoder_source, use_fast=True)
-    if cfg.get("use_ast_seq"):
-        set_ast_seq_len(int(cfg.get("ast_seq_len", 256)))
-    else:
-        set_ast_seq_len(None)
 
     bundle = build_bundle_from_config(cfg, tokenizer, data_path)
     if not bundle.bag_level:

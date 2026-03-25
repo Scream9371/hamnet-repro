@@ -198,20 +198,10 @@ class HamNetEncoder(nn.Module):
         unfreeze_last_n: int = 0,
         use_hier_attn: bool = True,
         use_graph: bool = True,
-        use_ast_seq: bool = False,
-        semantic_chunk_size: int = 0,
-        enable_gradient_checkpointing: bool = False,
     ) -> None:
 
         super().__init__()
         self.encoder = AutoModel.from_pretrained(encoder_name)
-        self.semantic_chunk_size = max(int(semantic_chunk_size), 0)
-        if enable_gradient_checkpointing:
-            try:
-                self.encoder.gradient_checkpointing_enable()
-            except Exception:
-
-                pass
         if freeze_encoder:
             for param in self.encoder.parameters():
                 param.requires_grad = False
@@ -227,7 +217,6 @@ class HamNetEncoder(nn.Module):
 
         self.use_hier_attn = use_hier_attn
         self.use_graph = use_graph
-        self.use_ast_seq = use_ast_seq
         self.graph_hidden = graph_hidden
         self.fusion_mode = "gate_concat"
 
@@ -241,7 +230,6 @@ class HamNetEncoder(nn.Module):
         self.sem_norm = nn.LayerNorm(hidden_size)
         self.graph_norm = nn.LayerNorm(graph_hidden) if self.use_graph else None
         self.delta_norm = nn.LayerNorm(hidden_size)
-        self.ast_seq_norm = nn.LayerNorm(graph_hidden) if self.use_ast_seq else None
 
         if self.use_graph:
             self.graph_encoder = GraphAttentionEncoder(
@@ -264,100 +252,31 @@ class HamNetEncoder(nn.Module):
             self.graph_to_sem = None
             self.graph_gate = None
 
-        if self.use_ast_seq:
-            self.ast_embedding = nn.Embedding(
-                node_vocab_size, graph_hidden, padding_idx=0
-            )
-            self.ast_conv = nn.Conv1d(
-                graph_hidden, graph_hidden, kernel_size=5, padding=2
-            )
-            self.ast_pool = nn.AdaptiveMaxPool1d(1)
-            fusion_dim += graph_hidden
-        else:
-            self.ast_embedding = None
-            self.ast_conv = None
-            self.ast_pool = None
-
         self.fusion_dim = fusion_dim
 
     def _encode_semantic(
         self, input_ids: torch.Tensor, attention_mask: torch.Tensor
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor | None]]:
-
-        total_funcs = int(input_ids.size(0))
-        chunk_size = self.semantic_chunk_size
-        if chunk_size <= 0 or total_funcs <= chunk_size:
-            encoder_outputs = self.encoder(
-                input_ids=input_ids, attention_mask=attention_mask
-            )
-            hidden_states = encoder_outputs.last_hidden_state
-            if (
-                hidden_states is not None
-                and self.use_hier_attn
-                and self.semantic_att is not None
-            ):
-                return self.semantic_att(hidden_states, attention_mask)
-            return hidden_states[:, 0, :], {
-                "token_weights": None,
-                "segment_weights": None,
-            }
-
-        semantic_chunks: List[torch.Tensor] = []
-        token_weight_chunks: List[torch.Tensor] = []
-        segment_weight_chunks: List[torch.Tensor] = []
-        has_token_weights = True
-        has_segment_weights = True
-
-        for start in range(0, total_funcs, chunk_size):
-            end = min(start + chunk_size, total_funcs)
-            chunk_ids = input_ids[start:end]
-            chunk_mask = attention_mask[start:end]
-            outputs = self.encoder(input_ids=chunk_ids, attention_mask=chunk_mask)
-            hidden_states = outputs.last_hidden_state
-            if (
-                hidden_states is not None
-                and self.use_hier_attn
-                and self.semantic_att is not None
-            ):
-                chunk_vec, chunk_attn = self.semantic_att(hidden_states, chunk_mask)
-                semantic_chunks.append(chunk_vec)
-                token_w = chunk_attn.get("token_weights")
-                seg_w = chunk_attn.get("segment_weights")
-                if token_w is None:
-                    has_token_weights = False
-                else:
-                    token_weight_chunks.append(token_w)
-                if seg_w is None:
-                    has_segment_weights = False
-                else:
-                    segment_weight_chunks.append(seg_w)
-            else:
-                semantic_chunks.append(hidden_states[:, 0, :])
-                has_token_weights = False
-                has_segment_weights = False
-
-        semantic_vec = torch.cat(semantic_chunks, dim=0)
-        semantic_attn = {
-            "token_weights": (
-                torch.cat(token_weight_chunks, dim=0)
-                if has_token_weights and token_weight_chunks
-                else None
-            ),
-            "segment_weights": (
-                torch.cat(segment_weight_chunks, dim=0)
-                if has_segment_weights and segment_weight_chunks
-                else None
-            ),
+        encoder_outputs = self.encoder(
+            input_ids=input_ids, attention_mask=attention_mask
+        )
+        hidden_states = encoder_outputs.last_hidden_state
+        if (
+            hidden_states is not None
+            and self.use_hier_attn
+            and self.semantic_att is not None
+        ):
+            return self.semantic_att(hidden_states, attention_mask)
+        return hidden_states[:, 0, :], {
+            "token_weights": None,
+            "segment_weights": None,
         }
-        return semantic_vec, semantic_attn
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         graphs: Sequence[Dict[str, torch.Tensor]],
-        ast_seq: torch.Tensor | None = None,
-        ast_mask: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
         semantic_vec, semantic_attn = self._encode_semantic(input_ids, attention_mask)
@@ -370,7 +289,6 @@ class HamNetEncoder(nn.Module):
         graph_attn = None
         graph_vec = None
         graph_mask = None
-        ast_vec = None
         if (
             self.use_graph
             and self.graph_encoder is not None
@@ -387,28 +305,9 @@ class HamNetEncoder(nn.Module):
                 delta = self.delta_norm(delta)
                 semantic_vec = self.sem_norm(semantic_vec + delta)
 
-        if self.use_ast_seq and ast_seq is not None:
-            ast_ids = ast_seq.to(semantic_vec.device)
-            ast_mask_t = (
-                ast_mask.to(semantic_vec.device) if ast_mask is not None else None
-            )
-            emb = self.ast_embedding(ast_ids)
-            emb = emb.transpose(1, 2)
-            conv_out = torch.relu(self.ast_conv(emb))
-            if ast_mask_t is not None:
-                mask = ast_mask_t.unsqueeze(1)
-                conv_out = conv_out.masked_fill(mask == 0, float("-inf"))
-            pooled = self.ast_pool(conv_out).squeeze(-1)
-            pooled = torch.nan_to_num(pooled, neginf=0.0)
-            if self.ast_seq_norm is not None:
-                pooled = self.ast_seq_norm(pooled.to(target_dtype))
-            ast_vec = pooled
-
         fuse_list = [semantic_vec]
         if graph_vec is not None:
             fuse_list.append(graph_vec.to(target_dtype))
-        if ast_vec is not None:
-            fuse_list.append(ast_vec.to(target_dtype))
         fused = torch.cat(fuse_list, dim=-1)
 
         attn_info = {
@@ -444,13 +343,6 @@ class HamNetMIL(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(self.hidden_size, 1),
         )
-
-    def meta_parameters(self):
-
-        for module in (self.attn_fc, self.attn_vec, self.adapter, self.classifier):
-            for param in module.parameters():
-                if param.requires_grad:
-                    yield param
 
     def mil_pool(
         self, h_funcs: torch.Tensor, bag_idx: torch.Tensor | None
@@ -505,16 +397,12 @@ class HamNetMIL(nn.Module):
         attention_mask: torch.Tensor,
         graphs: Sequence[Dict[str, torch.Tensor]],
         bag_idx: torch.Tensor | None = None,
-        ast_seq: torch.Tensor | None = None,
-        ast_mask: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
 
         h_funcs, attn_info = self.encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
             graphs=graphs,
-            ast_seq=ast_seq,
-            ast_mask=ast_mask,
         )
         bag_repr, bag_attn = self.mil_pool(h_funcs, bag_idx)
         adapted = bag_repr + self.adapter(self.dropout(bag_repr))
@@ -537,9 +425,6 @@ class HAMNetModel(HamNetMIL):
         unfreeze_last_n: int = 0,
         use_hier_attn: bool = True,
         use_graph: bool = True,
-        use_ast_seq: bool = False,
-        semantic_chunk_size: int = 0,
-        enable_gradient_checkpointing: bool = False,
     ) -> None:
 
         encoder = HamNetEncoder(
@@ -552,8 +437,5 @@ class HAMNetModel(HamNetMIL):
             unfreeze_last_n=unfreeze_last_n,
             use_hier_attn=use_hier_attn,
             use_graph=use_graph,
-            use_ast_seq=use_ast_seq,
-            semantic_chunk_size=semantic_chunk_size,
-            enable_gradient_checkpointing=enable_gradient_checkpointing,
         )
         super().__init__(encoder=encoder, dropout=dropout)

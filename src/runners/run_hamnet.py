@@ -5,7 +5,6 @@ import copy
 import json
 import math
 import os
-import random
 import sys
 import time
 from functools import partial
@@ -16,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.amp import GradScaler, autocast
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -37,7 +36,6 @@ from hamnet.data import (
     infer_dataset_name,
     load_caps_map,
     load_records,
-    set_ast_seq_len,
 )
 from hamnet.early_stop import EarlyStopper, pick_monitor_key
 from hamnet.metrics import compute_classification_metrics
@@ -223,22 +221,6 @@ def parse_args() -> argparse.Namespace:
     # Fixed internal defaults for the paper-focused path.
     args.threshold = 0.5
     args.max_samples = None
-    args.semantic_chunk_size = 0
-    args.meta_tasks_per_epoch = 0
-    args.meta_support_size = 8
-    args.meta_query_size = 8
-    args.meta_inner_steps = 1
-    args.meta_inner_lr = 5e-5
-    args.meta_step_size = 0.5
-    args.meta_batch_size = 4
-    args.use_ast_seq = False
-    args.ast_seq_len = 256
-    args.gradient_checkpointing = False
-    args.run_interpretability = False
-    args.interp_split = "test"
-    args.interp_ratios = "0.1,0.2,0.3,0.5"
-    args.interp_random_trials = 20
-    args.interp_max_bags = 0
     return args
 
 
@@ -294,8 +276,6 @@ def move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[st
                 }
                 for graph in value
             ]
-        elif key in ("ast_seq", "ast_mask"):
-            moved[key] = value.to(device, non_blocking=True)
         else:
             moved[key] = value
     return moved
@@ -327,8 +307,6 @@ def run_eval(
                     attention_mask=batch_on_device["attention_mask"],
                     graphs=batch_on_device["graphs"],
                     bag_idx=batch_on_device.get("bag_idx"),
-                    ast_seq=batch_on_device.get("ast_seq"),
-                    ast_mask=batch_on_device.get("ast_mask"),
                 )
             probs = torch.sigmoid(logits)
             loss = criterion(logits, batch_on_device["labels"])
@@ -366,8 +344,6 @@ def collect_probs(
                     attention_mask=batch_on_device["attention_mask"],
                     graphs=batch_on_device["graphs"],
                     bag_idx=batch_on_device.get("bag_idx"),
-                    ast_seq=batch_on_device.get("ast_seq"),
-                    ast_mask=batch_on_device.get("ast_mask"),
                 )
             prob = torch.sigmoid(logits)
             loss = criterion(logits, batch_on_device["labels"])
@@ -463,161 +439,6 @@ def auto_thresholds(labels, probs):
     return search_best_threshold(labels, probs)
 
 
-def build_project_index(dataset) -> Tuple[Dict[str, List[int]], Dict[str, Dict[int, List[int]]]]:
-    """Build project-level index maps for optional meta-learning code paths."""
-    project_all: Dict[str, List[int]] = {}
-    project_by_label: Dict[str, Dict[int, List[int]]] = {}
-    for idx, sample in enumerate(dataset.samples):
-        project = sample.get("project", "unknown")
-        label = int(round(sample.get("label", 0)))
-        project_all.setdefault(project, []).append(idx)
-        project_by_label.setdefault(project, {}).setdefault(label, []).append(idx)
-    return project_all, project_by_label
-
-
-def sample_task_indices(
-    candidates: Dict[int, List[int]], support: int, query: int
-) -> Optional[Dict[str, List[int]]]:
-    """Sample support/query indices for legacy meta-learning paths."""
-    pos = list(candidates.get(1, []))
-    neg = list(candidates.get(0, []))
-    total = len(pos) + len(neg)
-    need = support + query
-    if total < max(need, 1):
-        return None
-    all_idx = pos + neg
-    if not pos or not neg:
-        chosen = random.sample(all_idx, need)
-        return {"support": chosen[:support], "query": chosen[support:]}
-
-    def pick_balanced(pos_pool, neg_pool, k):
-        pos_k = min(len(pos_pool), max(k // 2, k - len(neg_pool)))
-        neg_k = min(len(neg_pool), k - pos_k)
-        chosen_pos = random.sample(pos_pool, pos_k) if pos_k > 0 else []
-        chosen_neg = random.sample(neg_pool, neg_k) if neg_k > 0 else []
-        picked = chosen_pos + chosen_neg
-        if len(picked) < k:
-            remain_pool = [i for i in (pos_pool + neg_pool) if i not in picked]
-            picked += random.sample(remain_pool, k - len(picked))
-        return picked
-
-    support_idxs = pick_balanced(pos, neg, support)
-    pos_rem = [i for i in pos if i not in support_idxs]
-    neg_rem = [i for i in neg if i not in support_idxs]
-    query_idxs = pick_balanced(pos_rem, neg_rem, query)
-    return {"support": support_idxs, "query": query_idxs}
-
-
-def run_meta_phase(
-    model: HAMNetModel,
-    dataset,
-    project_label_index: Dict[str, Dict[int, List[int]]],
-    criterion: nn.Module,
-    device: torch.device,
-    args: argparse.Namespace,
-    collate_fn,
-) -> List[Dict[str, float]]:
-    """Legacy meta-learning phase kept disabled in the paper path."""
-    if args.meta_tasks_per_epoch <= 0:
-        return []
-    valid_projects = [
-        name
-        for name, label_map in project_label_index.items()
-        if (len(label_map.get(0, [])) + len(label_map.get(1, [])))
-        >= max(args.meta_support_size + args.meta_query_size, 1)
-    ]
-    if not valid_projects:
-        return []
-
-    weights = []
-    for name in valid_projects:
-        size = len(project_label_index[name].get(0, [])) + len(
-            project_label_index[name].get(1, [])
-        )
-        weights.append(1.0 / max(size, 1))
-
-    meta_logs: List[Dict[str, float]] = []
-    for _ in range(args.meta_tasks_per_epoch):
-        project = random.choices(valid_projects, weights=weights, k=1)[0]
-        label_buckets = project_label_index[project]
-        split = sample_task_indices(
-            label_buckets, args.meta_support_size, args.meta_query_size
-        )
-        if not split:
-            continue
-        support_loader = DataLoader(
-            Subset(dataset, split["support"]),
-            batch_size=args.meta_batch_size,
-            shuffle=True,
-            collate_fn=collate_fn,
-        )
-        meta_params = list(model.meta_parameters())
-        if not meta_params:
-            continue
-        fast_opt = torch.optim.SGD(meta_params, lr=args.meta_inner_lr)
-        original_params = [param.data.detach().clone() for param in meta_params]
-        model.train()
-        inner_steps = 0
-        for batch in support_loader:
-            batch_on_device = move_batch_to_device(batch, device)
-            logits, _ = model(
-                input_ids=batch_on_device["input_ids"],
-                attention_mask=batch_on_device["attention_mask"],
-                graphs=batch_on_device["graphs"],
-                bag_idx=batch_on_device.get("bag_idx"),
-                ast_seq=batch_on_device.get("ast_seq"),
-                ast_mask=batch_on_device.get("ast_mask"),
-            )
-            loss = criterion(logits, batch_on_device["labels"])
-            fast_opt.zero_grad()
-            torch.autograd.backward(loss, inputs=meta_params)
-            fast_opt.step()
-            inner_steps += 1
-            if inner_steps >= args.meta_inner_steps:
-                break
-
-        with torch.no_grad():
-            for param, orig in zip(meta_params, original_params):
-                delta = param.data - orig
-                param.data.copy_(orig + args.meta_step_size * delta)
-
-        query_loss = None
-        if split["query"]:
-            query_loader = DataLoader(
-                Subset(dataset, split["query"]),
-                batch_size=args.meta_batch_size,
-                shuffle=False,
-                collate_fn=collate_fn,
-            )
-            losses = []
-            model.eval()
-            with torch.no_grad():
-                for batch in query_loader:
-                    batch_on_device = move_batch_to_device(batch, device)
-                    logits, _ = model(
-                        input_ids=batch_on_device["input_ids"],
-                        attention_mask=batch_on_device["attention_mask"],
-                        graphs=batch_on_device["graphs"],
-                        bag_idx=batch_on_device.get("bag_idx"),
-                        ast_seq=batch_on_device.get("ast_seq"),
-                        ast_mask=batch_on_device.get("ast_mask"),
-                    )
-                    q_loss = criterion(logits, batch_on_device["labels"])
-                    losses.append(q_loss.item())
-            if losses:
-                query_loss = float(np.mean(losses))
-
-        meta_logs.append(
-            {
-                "project": project,
-                "support": len(split["support"]),
-                "query": len(split["query"]),
-                "query_loss": query_loss,
-            }
-        )
-    return meta_logs
-
-
 def main() -> None:
     """Main entry."""
     args = parse_args()
@@ -680,7 +501,6 @@ def main() -> None:
                 f"[WARN] Local encoder path does not exist: {local_path}. Falling back to {args.encoder_name}."
             )
     tokenizer = AutoTokenizer.from_pretrained(encoder_source, use_fast=True)
-    set_ast_seq_len(args.ast_seq_len if args.use_ast_seq else None)
     bundle = build_bundle_from_split(
         train_records,
         val_records,
@@ -708,9 +528,6 @@ def main() -> None:
         unfreeze_last_n=args.unfreeze_last_n,
         use_graph=not args.no_graph,
         use_hier_attn=not args.no_hier_attn,
-        use_ast_seq=args.use_ast_seq,
-        semantic_chunk_size=args.semantic_chunk_size,
-        enable_gradient_checkpointing=args.gradient_checkpointing,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -765,23 +582,9 @@ def main() -> None:
     best_epoch = 0
 
     log_writer = JSONLWriter(args.output_dir / "training_log.jsonl")
-    project_index, project_label_index = build_project_index(bundle.train)
 
     try:
         for epoch in range(1, args.epochs + 1):
-            if args.meta_tasks_per_epoch > 0:
-                meta_logs = run_meta_phase(
-                    model,
-                    bundle.train,
-                    project_label_index,
-                    criterion,
-                    device,
-                    args,
-                    collate_fn,
-                )
-            else:
-                meta_logs = []
-
             model.train()
             epoch_losses: List[float] = []
             optimizer.zero_grad()
@@ -797,8 +600,6 @@ def main() -> None:
                         attention_mask=batch_on_device["attention_mask"],
                         graphs=batch_on_device["graphs"],
                         bag_idx=batch_on_device.get("bag_idx"),
-                        ast_seq=batch_on_device.get("ast_seq"),
-                        ast_mask=batch_on_device.get("ast_mask"),
                     )
                     labels = batch_on_device["labels"]
                     loss = criterion(logits, labels) / args.grad_accum
@@ -838,7 +639,6 @@ def main() -> None:
                 "epoch": epoch,
                 "train_loss": train_loss,
                 "val_metrics": val_metrics,
-                "meta_logs": meta_logs,
                 "duration_sec": time.time() - start_time,
             }
             log_writer.write(epoch_record)

@@ -4,6 +4,8 @@ datasets/*
 checkpoints/*
 !checkpoints/.gitkeep
 
+outputs/smoke/*
+
 __pycache__/
 *.py[cod]
 *$py.class
